@@ -29,6 +29,7 @@ import Path.Op.Custom as custom
 import Path.Op.Gui.Base as GuiBase
 from Path.Op.Gui.Base import CommandResources, TaskPanelPage
 from Path.Base import FeedRate
+import PathScripts.PathUtils as PathUtils
 from PySide6 import QtWidgets, QtCore
 from opencamlib import ocl
 
@@ -744,6 +745,34 @@ def _projected_to_vectors(projected):
     return result
 
 
+def optimize_linear_path(points, params):
+    """
+    Use FreeCAD 1.1.3's own 3D line simplifier.
+    """
+    if len(points) < 3:
+        return points
+
+    if not params.get("optimize_linear_paths", True):
+        return points
+
+    tolerance = max(
+        float(params.get("linear_deflection", 0.001)),
+        1e-9,
+    )
+
+    try:
+        return PathUtils.simplify3dLine(
+            points,
+            tolerance=tolerance,
+        )
+    except Exception as exc:
+        FreeCAD.Console.PrintWarning(
+            "STL Surface V2: FreeCAD simplify3dLine failed: %s\n"
+            % exc
+        )
+        return remove_collinear(points)
+
+
 # ---------------------------------------------------------------------------
 # Custom operation
 # ---------------------------------------------------------------------------
@@ -850,6 +879,26 @@ def create_operation(job, mesh_obj, tool_controller, params):
         "Sampling",
         "Parameters",
     )
+    add_prop(
+        "App::PropertyBool",
+        "OptimizeLinearPaths",
+        "Optimization",
+    )
+    add_prop(
+        "App::PropertyBool",
+        "OptimizeStepOverTransitions",
+        "Optimization",
+    )
+    add_prop(
+        "App::PropertyDistance",
+        "GapThreshold",
+        "Optimization",
+    )
+    add_prop(
+        "App::PropertyDistance",
+        "LinearDeflection",
+        "Optimization",
+    )
 
     op.IsCustomOp = True
     op.STLSource = mesh_obj
@@ -864,6 +913,10 @@ def create_operation(job, mesh_obj, tool_controller, params):
     op.AllowanceZ = params["allowance_z"]
     op.Margin = params["margin"]
     op.Sampling = params["sampling"]
+    op.OptimizeLinearPaths = params["optimize_linear_paths"]
+    op.OptimizeStepOverTransitions = params["optimize_stepover_transitions"]
+    op.GapThreshold = params["gap_threshold"]
+    op.LinearDeflection = params["linear_deflection"]
 
     return op
 
@@ -1000,7 +1053,7 @@ def generate_toolpath(
         segment_count = len(cutting_segments)
 
         for segment_index, points in enumerate(cutting_segments):
-            points = remove_collinear(points)
+            points = optimize_linear_path(points, params)
 
             if len(points) < 2:
                 continue
@@ -1187,6 +1240,24 @@ class SurfaceV2Dialog(QtWidgets.QDialog):
             ["X", "Y"]
         )
 
+        self.optimize_linear = QtWidgets.QCheckBox()
+        self.optimize_linear.setChecked(True)
+
+        self.optimize_transitions = QtWidgets.QCheckBox()
+        self.optimize_transitions.setChecked(False)
+
+        self.gap_threshold = QtWidgets.QDoubleSpinBox()
+        self.gap_threshold.setRange(0.0, 100.0)
+        self.gap_threshold.setValue(0.005)
+        self.gap_threshold.setDecimals(4)
+        self.gap_threshold.setSuffix(" mm")
+
+        self.linear_deflection = QtWidgets.QDoubleSpinBox()
+        self.linear_deflection.setRange(0.000001, 100.0)
+        self.linear_deflection.setValue(0.001)
+        self.linear_deflection.setDecimals(6)
+        self.linear_deflection.setSuffix(" mm")
+
         layout.addRow(
             "STL:",
             self.source,
@@ -1234,6 +1305,22 @@ class SurfaceV2Dialog(QtWidgets.QDialog):
         layout.addRow(
             "Direction:",
             self.direction,
+        )
+        layout.addRow(
+            "Optimize Linear Paths:",
+            self.optimize_linear,
+        )
+        layout.addRow(
+            "Optimize Step Over Transitions:",
+            self.optimize_transitions,
+        )
+        layout.addRow(
+            "Gap Threshold:",
+            self.gap_threshold,
+        )
+        layout.addRow(
+            "Linear Deflection:",
+            self.linear_deflection,
         )
 
         buttons = QtWidgets.QDialogButtonBox(
@@ -1296,6 +1383,10 @@ class SurfaceV2Dialog(QtWidgets.QDialog):
             "margin": self.margin.value(),
             "sampling": self.sampling.value(),
             "direction": self.direction.currentText(),
+            "optimize_linear_paths": self.optimize_linear.isChecked(),
+            "optimize_stepover_transitions": self.optimize_transitions.isChecked(),
+            "gap_threshold": self.gap_threshold.value(),
+            "linear_deflection": self.linear_deflection.value(),
         }
 
 
