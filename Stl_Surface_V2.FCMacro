@@ -30,6 +30,7 @@ import Path.Op.Gui.Base as GuiBase
 from Path.Op.Gui.Base import CommandResources, TaskPanelPage
 from Path.Base import FeedRate
 import PathScripts.PathUtils as PathUtils
+import Path.Op.SurfaceSupport as PathSurfaceSupport
 from PySide6 import QtWidgets, QtCore
 from opencamlib import ocl
 
@@ -247,72 +248,50 @@ def get_tool_controllers(job):
     return result
 
 
-def make_ocl_surface(mesh_obj):
-    surface = ocl.STLSurf()
+class _SurfaceSupportOperationShim:
+    """
+    Minimal adapter used only to call FreeCAD's own SurfaceSupport helpers.
 
-    for facet in mesh_obj.Mesh.Facets:
-        p1, p2, p3 = facet.Points
-
-        surface.addTriangle(
-            ocl.Triangle(
-                ocl.Point(*p1),
-                ocl.Point(*p2),
-                ocl.Point(*p3),
-            )
+    The machining algorithms stay in FreeCAD. The shim only supplies the
+    properties that SurfaceSupport needs because our STL source is a Mesh
+    rather than the normal Part/Job Base geometry of ObjectSurface.
+    """
+    def __init__(self, tool_controller, linear_deflection=0.001,
+                 angular_deflection=0.523599):
+        self.ToolController = tool_controller
+        self.LinearDeflection = FreeCAD.Units.Quantity(
+            "%s mm" % float(linear_deflection)
+        )
+        self.AngularDeflection = FreeCAD.Units.Quantity(
+            "%s rad" % float(angular_deflection)
         )
 
-    return surface
 
-
-def make_ocl_cutter(tool):
-    shape_id = getattr(tool, "ShapeID", "")
-
-    if shape_id == "endmill":
-        return ocl.CylCutter(
-            tool.Diameter.Value,
-            tool.Length.Value,
-        )
-
-    if shape_id == "ballend":
-        return ocl.BallCutter(
-            tool.Diameter.Value,
-            tool.Length.Value,
-        )
-
-    if shape_id == "bullnose":
-        return ocl.BullCutter(
-            tool.Diameter.Value,
-            tool.CornerRadius.Value,
-            tool.CuttingEdgeHeight.Value,
-        )
-
-    if shape_id == "v-bit":
-        return ocl.ConeCutter(
-            tool.Diameter.Value,
-            tool.CuttingEdgeAngle.Value / 2.0,
-            tool.CuttingEdgeHeight.Value,
-        )
-
-    raise RuntimeError(
-        "Unsupported OCL cutter type: %s" % shape_id
+def make_ocl_surface(mesh_obj, linear_deflection=0.001):
+    """Use FreeCAD SurfaceSupport's native Mesh -> OCL conversion."""
+    shim = _SurfaceSupportOperationShim(
+        None,
+        linear_deflection=linear_deflection,
+    )
+    return PathSurfaceSupport._makeSTL(
+        mesh_obj,
+        shim,
+        ocl,
+        model_type="Mesh",
     )
 
 
-def remove_collinear(points, tol=1e-7):
-    if len(points) < 3:
-        return points
-
-    result = [points[0]]
-
-    for i in range(1, len(points) - 1):
-        v1 = points[i] - result[-1]
-        v2 = points[i + 1] - points[i]
-
-        if v1.cross(v2).Length > tol:
-            result.append(points[i])
-
-    result.append(points[-1])
-    return result
+def make_ocl_cutter(tool_controller):
+    """Use FreeCAD's native ToolBit -> OCL cutter conversion."""
+    shim = _SurfaceSupportOperationShim(tool_controller)
+    ocl_tool = PathSurfaceSupport.OCL_Tool(
+        ocl,
+        shim,
+    )
+    cutter = ocl_tool.getOclTool()
+    if cutter is None:
+        raise RuntimeError("FreeCAD SurfaceSupport could not create an OCL cutter.")
+    return cutter
 
 
 def make_planar_bbox(mesh_obj, margin=0.0, allowance_xy=0.0):
@@ -917,7 +896,9 @@ def optimize_linear_path(points, params):
             "STL Surface V2: FreeCAD simplify3dLine failed: %s\n"
             % exc
         )
-        return remove_collinear(points)
+        raise RuntimeError(
+            "FreeCAD PathUtils.simplify3dLine is unavailable or failed: %s" % exc
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1108,9 +1089,11 @@ def generate_toolpath(
                 "Calculation cancelled by user"
             )
 
-    tool = tool_controller.Tool
-    cutter = make_ocl_cutter(tool)
-    surface = make_ocl_surface(mesh_obj)
+    cutter = make_ocl_cutter(tool_controller)
+    surface = make_ocl_surface(
+        mesh_obj,
+        float(params.get("linear_deflection", 0.001)),
+    )
 
     update_progress(
         2,
