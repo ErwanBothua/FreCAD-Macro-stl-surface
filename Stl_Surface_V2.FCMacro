@@ -736,69 +736,6 @@ def project_polyline_with_ocl(
     ]
 
 
-def _is_point_like(value):
-    return (
-        hasattr(value, "x")
-        and hasattr(value, "y")
-        and hasattr(value, "z")
-    )
-
-
-def _projected_to_vectors(projected):
-    """
-    Normalize FreeCAD/OCL projection results to FreeCAD.Vector lists.
-    """
-    result = []
-
-    for p in projected:
-        if _is_point_like(p):
-            result.append(
-                FreeCAD.Vector(
-                    float(p.x),
-                    float(p.y),
-                    float(p.z),
-                )
-            )
-        else:
-            result.append(
-                FreeCAD.Vector(
-                    float(p[0]),
-                    float(p[1]),
-                    float(p[2]),
-                )
-            )
-
-    return result
-
-
-def optimize_linear_path(points, params):
-    """
-    Use FreeCAD 1.1.3's own 3D line simplifier.
-    """
-    if len(points) < 3:
-        return points
-
-    if not params.get("optimize_linear_paths", True):
-        return points
-
-    tolerance = max(
-        float(params.get("linear_deflection", 0.001)),
-        1e-9,
-    )
-
-    try:
-        return PathUtils.simplify3dLine(
-            points,
-            tolerance=tolerance,
-        )
-    except Exception as exc:
-        FreeCAD.Console.PrintWarning(
-            "STL Surface V2: FreeCAD simplify3dLine failed: %s\n"
-            % exc
-        )
-        raise RuntimeError(
-            "FreeCAD PathUtils.simplify3dLine is unavailable or failed: %s" % exc
-        )
 
 
 # ---------------------------------------------------------------------------
