@@ -1,0 +1,59 @@
+# -*- coding: utf-8 -*-
+"""
+FreeCAD CAM Macro - STL Surface V2
+
+V2 development branch/file.
+
+Goal:
+- Reuse FreeCAD CAM strategy code as much as possible.
+- Keep OpenCAMLib responsible for STL surface Z calculation.
+- Integrate the resulting toolpath into an existing FreeCAD CAM Job.
+
+This file is intentionally a clean V2 starting point.
+The current V1 remains unchanged in Stl_Surface.FCMacro.
+
+Planned strategies:
+- Line
+- Zigzag
+- Circular
+- Circular Zigzag
+- Offset
+- Spiral
+
+Planned architecture:
+    FreeCAD CAM strategy
+            |
+            v
+       XY toolpath
+            |
+            v
+     OpenCAMLib OCL
+            |
+            v
+       surface Z
+            |
+            v
+      FreeCAD Path
+            |
+            v
+       CAM Job
+
+Do not duplicate FreeCAD CAM algorithms unless necessary.
+Prefer calling/reusing FreeCAD's existing implementation so future
+FreeCAD CAM improvements can benefit this macro.
+"""
+
+import FreeCAD
+
+
+def main():
+    FreeCAD.Console.PrintMessage(
+        "STL Surface V2: development file created.\n"
+    )
+    FreeCAD.Console.PrintMessage(
+        "No toolpath generation is implemented yet.\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
