@@ -31,6 +31,10 @@ from Path.Op.Gui.Base import CommandResources, TaskPanelPage
 from Path.Base import FeedRate
 import PathScripts.PathUtils as PathUtils
 import Path.Op.SurfaceSupport as PathSurfaceSupport
+try:
+    import Path.Op.Surface as PathSurface
+except Exception:
+    PathSurface = None
 from PySide6 import QtWidgets, QtCore
 from opencamlib import ocl
 
@@ -573,6 +577,49 @@ def generate_strategy_polylines(
 
     return polylines
 
+
+# ---------------------------------------------------------------------------
+# Native FreeCAD Surface algorithm adapter
+# ---------------------------------------------------------------------------
+
+class NativeSurfaceAlgorithmAdapter:
+    """
+    Reuse FreeCAD 1.1.x ObjectSurface algorithms directly.
+
+    This object is only a bridge because ObjectSurface normally receives its
+    geometry through a standard CAM Base property. V2 supplies the STL/OCL
+    data itself, then delegates depth processing, linear-path processing and
+    step-over transitions to FreeCAD's own implementation.
+    """
+    def __init__(self, tool_controller, cutter, params):
+        if PathSurface is None:
+            raise RuntimeError("FreeCAD Surface operation is unavailable.")
+
+        self.impl = PathSurface.ObjectSurface.__new__(PathSurface.ObjectSurface)
+        self.impl.cutter = cutter
+        self.impl.toolDiam = float(tool_controller.Tool.Diameter.Value)
+        self.impl.horizFeed = getattr(tool_controller, "HorizFeed", 0.0)
+        self.impl.horizRapid = getattr(tool_controller, "HorizRapid", 0.0)
+        self.impl.vertRapid = getattr(tool_controller, "VertRapid", 0.0)
+        self.impl.CutClimb = params.get("cut_mode", "Climb") == "Climb"
+        self.impl.preOLP = bool(params.get("optimize_linear_paths", True))
+        self.impl.tmpCOM = FreeCAD.Vector(0.0, 0.0, 0.0)
+
+    def singlepass(self, op, points):
+        return self.impl._planarSinglepassProcess(op, points)
+
+    def multipass_preprocess(self, op, points, prev_depth, layer_depth):
+        return self.impl._planarMultipassPreProcess(
+            op, points, prev_depth, layer_depth
+        )
+
+    def multipass_process(self, op, points, max_z):
+        return self.impl._planarMultipassProcess(op, points, max_z)
+
+    def transition(self, op, p1, p2, safe_pdc, tolerance):
+        return self.impl._stepTransitionCmds(
+            op, p1, p2, safe_pdc, tolerance
+        )
 
 # ---------------------------------------------------------------------------
 # OCL projection
@@ -1152,9 +1199,87 @@ def generate_toolpath(
 
     commands = []
 
-    FreeCAD.Console.PrintMessage(
-        "STL Surface V2: material-aware rest machining enabled.\\n"
+    native = NativeSurfaceAlgorithmAdapter(
+        tool_controller,
+        cutter,
+        params,
     )
+
+    # Build the same SCANDATA nesting expected by FreeCAD Surface.
+    # Each FreeCAD-generated strategy polyline remains a separate step-over.
+    scan_data = []
+    for polyline in polylines:
+        projected = project_polyline_with_ocl(
+            surface,
+            cutter,
+            polyline,
+            passes[-1],
+            float(params["sampling"]),
+            params["mode"],
+        )
+        if projected and len(projected) >= 2:
+            scan_data.append([projected])
+
+    if not scan_data:
+        raise RuntimeError("No OCL scan data was generated.")
+
+    # Native FreeCAD Surface expects an operation object exposing its normal
+    # Surface properties. We keep the STL-specific Custom operation but feed
+    # the native algorithm a property-compatible shim.
+    surface_op = type("NativeSurfaceProperties", (), {})()
+    surface_op.SafeHeight = FreeCAD.Units.Quantity("%s mm" % safe_z)
+    surface_op.ClearanceHeight = FreeCAD.Units.Quantity("%s mm" % job_clearance)
+    surface_op.StepDown = FreeCAD.Units.Quantity("%s mm" % step_down)
+    surface_op.LinearDeflection = FreeCAD.Units.Quantity(
+        "%s mm" % float(params["linear_deflection"])
+    )
+    surface_op.FinalDepth = FreeCAD.Units.Quantity(
+        "%s mm" % (top_z - depth)
+    )
+    surface_op.OptimizeLinearPaths = bool(params["optimize_linear_paths"])
+    surface_op.OptimizeStepOverTransitions = bool(params["optimize_stepover_transitions"])
+    surface_op.CutPattern = "CircularZigZag" if params["strategy"] == "Circular Zigzag" else params["strategy"]
+    surface_op.CircularUseG2G3 = bool(params.get("circular_use_g2g3", False))
+    surface_op.ProfileEdges = "None"
+    surface_op.HandleMultipleFeatures = "Collectively"
+
+    # One OCL PDC is shared by all FreeCAD strategy segments, exactly as the
+    # native planar Surface implementation does.
+    pdc = ocl.PathDropCutter()
+    pdc.setSTL(surface)
+    pdc.setCutter(cutter)
+    pdc.setZ(passes[-1])
+    pdc.setSampling(float(params["sampling"]))
+
+    # Safe transition evaluation is intentionally disabled unless explicitly
+    # requested. A future version can supply FreeCAD's native safe STL here.
+    safe_pdc = pdc
+
+    tolerance = 0.001
+    depth_params = list(passes)
+
+    if params["mode"] == "Finishing":
+        for step in scan_data:
+            for points in step:
+                commands.extend(native.singlepass(surface_op, points))
+    else:
+        # Delegate layer-depth handling and hold-point logic to FreeCAD.
+        prev_depth = depth_params[0]
+        for layer_depth in depth_params:
+            for step in scan_data:
+                for points in step:
+                    pts, max_z = native.multipass_preprocess(
+                        surface_op,
+                        list(points),
+                        prev_depth,
+                        layer_depth,
+                    )
+                    if pts:
+                        commands.extend(
+                            native.multipass_process(surface_op, pts, max_z)
+                        )
+            prev_depth = layer_depth
+
 
     for pass_index, pass_z in enumerate(passes):
         update_progress(
