@@ -33,6 +33,9 @@ import PathScripts.PathUtils as PathUtils
 from PySide6 import QtWidgets, QtCore
 from opencamlib import ocl
 
+# V2 intentionally builds on FreeCAD CAM APIs instead of replacing them.
+# The STL/Mesh -> OCL surface conversion is the only geometry-specific bridge.
+
 
 # ---------------------------------------------------------------------------
 # FreeCAD CAM imports
@@ -121,6 +124,73 @@ def find_jobs(doc):
 
 def get_job_label(job):
     return getattr(job, "Label", getattr(job, "Name", "Job"))
+
+
+def _native_surface_height(job, property_name, fallback):
+    """Read a native CAM Job height when available, without requiring it."""
+    try:
+        value = getattr(job, property_name)
+        if hasattr(value, "Value"):
+            return float(value.Value)
+        return float(value)
+    except Exception:
+        return float(fallback)
+
+
+def _add_native_surface_properties(op, add_prop):
+    """
+    Mirror the important FreeCAD Surface operation property names.
+
+    The STL operation remains a Custom operation because a Mesh/STL is not a
+    normal Part::Feature face source for ObjectSurface.  Keeping the native
+    Surface property vocabulary here is intentional: it makes the operation
+    much easier to migrate into Path/Op when FreeCAD gains a native Mesh/STL
+    surface source.
+    """
+    add_prop("App::PropertyEnumeration", "CutPattern", "Surface")
+    add_prop("App::PropertyEnumeration", "CutMode", "Surface")
+    add_prop("App::PropertyEnumeration", "LayerMode", "Depth")
+    add_prop("App::PropertyAngle", "CutPatternAngle", "Surface")
+    add_prop("App::PropertyBool", "CutPatternReversed", "Surface")
+    add_prop("App::PropertyFloat", "StepOver", "Surface")
+    add_prop("App::PropertyDistance", "SampleInterval", "Surface")
+    add_prop("App::PropertyDistance", "StartDepth", "Depth")
+    add_prop("App::PropertyDistance", "FinalDepth", "Depth")
+    add_prop("App::PropertyDistance", "DepthOffset", "Depth")
+    add_prop("App::PropertyDistance", "SafeHeight", "Depth")
+    add_prop("App::PropertyDistance", "ClearanceHeight", "Depth")
+    add_prop("App::PropertyBool", "CircularUseG2G3", "Optimization")
+
+    try:
+        op.CutPattern = [
+            "Line", "Zigzag", "Circular",
+            "CircularZigZag", "Offset", "Spiral"
+        ]
+        op.CutMode = ["Climb", "Conventional"]
+        op.LayerMode = ["Single-pass", "Multi-pass"]
+    except Exception:
+        pass
+
+
+def _set_native_surface_values(op, params, top_z):
+    """Populate native Surface-compatible properties from V2 parameters."""
+    pattern = params["strategy"]
+    if pattern == "Circular Zigzag":
+        pattern = "CircularZigZag"
+
+    op.CutPattern = pattern
+    op.CutMode = params.get("cut_mode", "Climb")
+    op.LayerMode = params.get("layer_mode", "Multi-pass")
+    op.CutPatternAngle = 90.0 if params["direction"] == "Y" else 0.0
+    op.CutPatternReversed = bool(params.get("cut_pattern_reversed", False))
+    op.StepOver = params["stepover_percent"]
+    op.SampleInterval = params["sampling"]
+    op.StartDepth = params.get("start_depth", top_z)
+    op.FinalDepth = params.get("final_depth", top_z - params["depth"])
+    op.DepthOffset = params.get("depth_offset", 0.0)
+    op.SafeHeight = params.get("safe_height", top_z)
+    op.ClearanceHeight = params.get("clearance_height", top_z)
+    op.CircularUseG2G3 = bool(params.get("circular_use_g2g3", False))
 
 
 def select_job(doc, mesh_obj):
@@ -896,6 +966,10 @@ def create_operation(job, mesh_obj, tool_controller, params):
         "IsCustomOp",
         "Path",
     )
+
+    # Keep the native Surface property vocabulary alongside the STL-specific
+    # properties. This is the key compatibility seam for future integration.
+    _add_native_surface_properties(op, add_prop)
     add_prop(
         "App::PropertyLink",
         "STLSource",
@@ -999,7 +1073,11 @@ def create_operation(job, mesh_obj, tool_controller, params):
     op.OptimizeStepOverTransitions = params["optimize_stepover_transitions"]
     op.GapThreshold = params["gap_threshold"]
     op.LinearDeflection = params["linear_deflection"]
-    op.OptimizationBackend = "FreeCAD 1.1.3 PathUtils + OCL transition engine"
+    _set_native_surface_values(op, params, params.get("top_z", 0.0))
+    op.OptimizationBackend = (
+        "FreeCAD SurfaceSupport + PathUtils + OCL; "
+        "native Surface property compatibility layer"
+    )
 
     return op
 
@@ -1075,7 +1153,20 @@ def generate_toolpath(
                 top_z - pass_depth
             )
 
-    safe_z = top_z
+    # Native Surface semantics: retain the same depth vocabulary used by
+    # FreeCAD. SafeHeight/StartDepth are currently resolved from the Job when
+    # a usable native value exists; otherwise the proven V1/V2 top-Z fallback
+    # is retained until this operation is fully delegated to ObjectSurface.
+    params["top_z"] = top_z
+    params["start_depth"] = top_z
+    params["final_depth"] = top_z - depth
+    params["depth_offset"] = float(params.get("depth_offset", 0.0))
+
+    job_clearance = _native_surface_height(job, "ClearanceHeight", top_z)
+    safe_z = max(top_z, job_clearance)
+    params["safe_height"] = safe_z
+    params["clearance_height"] = job_clearance
+
     commands = []
 
     FreeCAD.Console.PrintMessage(
@@ -1497,6 +1588,12 @@ class SurfaceV2Dialog(QtWidgets.QDialog):
             "margin": self.margin.value(),
             "sampling": self.sampling.value(),
             "direction": self.direction.currentText(),
+            # Native FreeCAD Surface vocabulary. The current V2 UI keeps these
+            # fixed until the native task-panel integration is introduced.
+            "cut_mode": "Climb",
+            "cut_pattern_reversed": False,
+            "layer_mode": "Multi-pass",
+            "circular_use_g2g3": False,
             "optimize_linear_paths": self.optimize_linear.isChecked(),
             "optimize_stepover_transitions": self.optimize_transitions.isChecked(),
             "gap_threshold": self.gap_threshold.value(),
