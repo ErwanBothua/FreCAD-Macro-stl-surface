@@ -512,43 +512,54 @@ def project_with_freecad_surface_generator(
     return None
 
 
-def project_with_ocl(
+def project_polyline_with_ocl(
     surface,
     cutter,
-    polylines,
+    polyline,
     min_z,
     sampling,
     mode,
 ):
     """
-    OCL fallback used when the FreeCAD wrapper is unavailable.
+    Project one FreeCAD strategy polyline with OCL.
+
+    Keeping the projection per source polyline is intentional in V2:
+    it preserves the natural breaks between scan lines/offset loops, which
+    lets the rest-machining optimizer insert rapids instead of accidentally
+    connecting two disconnected cutting regions.
     """
+
+    if len(polyline) < 2:
+        return []
 
     projected = project_with_freecad_surface_generator(
         surface,
         cutter,
-        polylines,
+        [polyline],
         min_z,
         sampling,
         mode,
     )
 
     if projected is not None:
-        return projected
+        return [
+            FreeCAD.Vector(
+                float(p[0]),
+                float(p[1]),
+                float(p[2]),
+            )
+            for p in projected
+        ]
 
     ocl_path = ocl.Path()
 
-    for line in polylines:
-        if len(line) < 2:
-            continue
-
-        for p1, p2 in zip(line[:-1], line[1:]):
-            ocl_path.append(
-                ocl.Line(
-                    ocl.Point(p1[0], p1[1], min_z),
-                    ocl.Point(p2[0], p2[1], min_z),
-                )
+    for p1, p2 in zip(polyline[:-1], polyline[1:]):
+        ocl_path.append(
+            ocl.Line(
+                ocl.Point(p1[0], p1[1], min_z),
+                ocl.Point(p2[0], p2[1], min_z),
             )
+        )
 
     pdc = ocl.PathDropCutter()
     pdc.setSTL(surface)
@@ -559,9 +570,118 @@ def project_with_ocl(
     pdc.run()
 
     return [
-        (cl.x, cl.y, cl.z)
+        FreeCAD.Vector(
+            float(cl.x),
+            float(cl.y),
+            float(cl.z),
+        )
         for cl in pdc.getCLPoints()
     ]
+
+
+def split_remaining_segments(
+    points,
+    pass_z,
+    allowance_z=0.0,
+    tolerance=0.001,
+):
+    """
+    Keep only the parts of a projected path where material still exists.
+
+    For a downward pass, a point needs machining when the STL contact Z is
+    below the requested pass plane. Points already above that plane mean
+    that this region has already reached (or exceeded) the requested depth.
+
+    The result is a list of independent cutting segments. A new segment is
+    started whenever the path enters/leaves a region that still needs work.
+    This is the first V2 rest-machining layer; it deliberately operates on
+    OCL's actual surface Z instead of trying to recreate the STL geometry.
+    """
+
+    if len(points) < 2:
+        return []
+
+    remaining = []
+    current = []
+
+    for point in points:
+        target_z = point.z + float(allowance_z)
+
+        if target_z < float(pass_z) - float(tolerance):
+            current.append(point)
+        else:
+            if len(current) >= 2:
+                remaining.append(current)
+            current = []
+
+    if len(current) >= 2:
+        remaining.append(current)
+
+    return remaining
+
+
+def optimize_pass(
+    projected_polylines,
+    pass_z,
+    allowance_z=0.0,
+):
+    """
+    Apply material-aware rest machining to one Z pass.
+
+    This does not change FreeCAD's strategy geometry. It only removes
+    portions for which OCL says the STL is already at/above the current
+    machining depth.
+    """
+
+    optimized = []
+    tolerance = max(0.001, abs(float(allowance_z)) * 0.1)
+
+    for points in projected_polylines:
+        optimized.extend(
+            split_remaining_segments(
+                points,
+                pass_z,
+                allowance_z,
+                tolerance,
+            )
+        )
+
+    return optimized
+
+
+def _is_point_like(value):
+    return (
+        hasattr(value, "x")
+        and hasattr(value, "y")
+        and hasattr(value, "z")
+    )
+
+
+def _projected_to_vectors(projected):
+    """
+    Normalize FreeCAD/OCL projection results to FreeCAD.Vector lists.
+    """
+    result = []
+
+    for p in projected:
+        if _is_point_like(p):
+            result.append(
+                FreeCAD.Vector(
+                    float(p.x),
+                    float(p.y),
+                    float(p.z),
+                )
+            )
+        else:
+            result.append(
+                FreeCAD.Vector(
+                    float(p[0]),
+                    float(p[1]),
+                    float(p[2]),
+                )
+            )
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +882,10 @@ def generate_toolpath(
     safe_z = top_z
     commands = []
 
+    FreeCAD.Console.PrintMessage(
+        "STL Surface V2: material-aware rest machining enabled.\\n"
+    )
+
     for pass_index, pass_z in enumerate(passes):
         update_progress(
             25 + (
@@ -776,67 +900,95 @@ def generate_toolpath(
             ),
         )
 
-        raw_points = project_with_ocl(
-            surface,
-            cutter,
-            polylines,
-            pass_z,
-            float(params["sampling"]),
-            params["mode"],
-        )
+        projected_polylines = []
 
-        if not raw_points:
-            continue
-
-        # FreeCAD's modern surface engine returns a flat CL stream.
-        points = [
-            FreeCAD.Vector(
-                float(p[0]),
-                float(p[1]),
-                float(p[2]),
-            )
-            for p in raw_points
-        ]
-
-        points = remove_collinear(points)
-
-        if not points:
-            continue
-
-        commands.append(
-            Path.Command(
-                "G0",
-                {"Z": safe_z},
-            )
-        )
-
-        commands.append(
-            Path.Command(
-                "G0",
-                {
-                    "X": points[0].x,
-                    "Y": points[0].y,
-                    "Z": pass_z,
-                },
-            )
-        )
-
-        for point in points:
-            cut_z = max(
-                point.z + float(params["allowance_z"]),
+        for polyline in polylines:
+            projected = project_polyline_with_ocl(
+                surface,
+                cutter,
+                polyline,
                 pass_z,
+                float(params["sampling"]),
+                params["mode"],
+            )
+
+            if projected:
+                projected_polylines.append(projected)
+
+        if not projected_polylines:
+            continue
+
+        # Material-aware rest machining:
+        # only keep path portions where OCL reports that the STL is below
+        # the current pass depth. Already-machined regions are omitted.
+        cutting_segments = optimize_pass(
+            projected_polylines,
+            pass_z,
+            float(params["allowance_z"]),
+        )
+
+        if not cutting_segments:
+            FreeCAD.Console.PrintMessage(
+                "STL Surface V2: pass %d/%d skipped (no remaining material).\\n"
+                % (
+                    pass_index + 1,
+                    len(passes),
+                )
+            )
+            continue
+
+        segment_count = len(cutting_segments)
+
+        for segment_index, points in enumerate(cutting_segments):
+            points = remove_collinear(points)
+
+            if len(points) < 2:
+                continue
+
+            commands.append(
+                Path.Command(
+                    "G0",
+                    {"Z": safe_z},
+                )
             )
 
             commands.append(
                 Path.Command(
-                    "G1",
+                    "G0",
                     {
-                        "X": point.x,
-                        "Y": point.y,
-                        "Z": cut_z,
+                        "X": points[0].x,
+                        "Y": points[0].y,
+                        "Z": pass_z,
                     },
                 )
             )
+
+            for point in points:
+                cut_z = max(
+                    point.z + float(params["allowance_z"]),
+                    pass_z,
+                )
+
+                commands.append(
+                    Path.Command(
+                        "G1",
+                        {
+                            "X": point.x,
+                            "Y": point.y,
+                            "Z": cut_z,
+                        },
+                    )
+                )
+
+        update_progress(
+            90,
+            "Optimizing pass %d/%d: %d cutting segments..."
+            % (
+                pass_index + 1,
+                len(passes),
+                segment_count,
+            ),
+        )
 
     commands.append(
         Path.Command(
