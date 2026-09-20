@@ -81,25 +81,85 @@ def get_selected_mesh():
     return obj
 
 
-def find_job(doc):
-    job = doc.getObject("Job")
+def find_jobs(doc):
+    """
+    Return every CAM Job in the active document.
 
-    if job:
-        return job
+    V2 deliberately does not assume that a Job is named "Job". FreeCAD
+    documents may contain several Jobs, and users commonly rename their
+    Job labels (for example Tile001, Tile002, ...).
+    """
+    jobs = []
 
     for obj in doc.Objects:
         try:
-            if obj.Name == "Job" or obj.Label == "Job":
-                return obj
+            if obj.TypeId.startswith("Path::Job"):
+                jobs.append(obj)
+                continue
+
+            # Compatibility with FreeCAD variants where the concrete TypeId
+            # is not exposed exactly as Path::Job.
+            if hasattr(obj, "Tools") and hasattr(obj, "Model"):
+                if obj.TypeId.startswith("Path"):
+                    jobs.append(obj)
         except Exception:
             pass
 
-    QtWidgets.QMessageBox.critical(
+    # Remove accidental duplicates while preserving document order.
+    unique = []
+    seen = set()
+
+    for job in jobs:
+        key = getattr(job, "Name", None)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(job)
+
+    return unique
+
+
+def get_job_label(job):
+    return getattr(job, "Label", getattr(job, "Name", "Job"))
+
+
+def select_job(doc, mesh_obj):
+    """
+    Select the Job used by this operation.
+
+    If there is only one Job, use it automatically.
+    If several Jobs exist, show a selection dialog.
+    """
+    jobs = find_jobs(doc)
+
+    if not jobs:
+        QtWidgets.QMessageBox.critical(
+            None,
+            "STL Surface V2",
+            "No CAM Job was found in the active document.",
+        )
+        return None
+
+    if len(jobs) == 1:
+        return jobs[0]
+
+    labels = [
+        get_job_label(job)
+        for job in jobs
+    ]
+
+    selected_label, ok = QtWidgets.QInputDialog.getItem(
         None,
-        "STL Surface V2",
-        "No CAM Job was found in the active document.",
+        "Sélection du Job",
+        "Job CAM à utiliser :",
+        labels,
+        0,
+        False,
     )
-    return None
+
+    if not ok:
+        return None
+
+    return jobs[labels.index(selected_label)]
 
 
 def get_tool_controllers(job):
@@ -1264,7 +1324,7 @@ def main():
     if mesh_obj is None:
         return
 
-    job = find_job(doc)
+    job = select_job(doc, mesh_obj)
 
     if job is None:
         return
