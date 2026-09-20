@@ -1104,21 +1104,38 @@ def generate_toolpath(
     pdc.setZ(passes[-1])
     pdc.setSampling(float(params["sampling"]))
 
-    # Safe transition evaluation is intentionally disabled unless explicitly
-    # requested. A future version can supply FreeCAD's native safe STL here.
+    # Use the native Surface transition algorithm. The current STL source is
+    # itself the collision surface; a dedicated stock-safe STL can be wired in
+    # later without changing the transition code path.
     safe_pdc = pdc
 
-    tolerance = 0.001
+    tolerance = _native_surface_height(job, "GeometryTolerance", 0.001)
     depth_params = list(passes)
 
     if params["mode"] == "Finishing":
+        previous_end = None
         for step in scan_data:
             for points in step:
+                if (
+                    previous_end is not None
+                    and params.get("optimize_stepover_transitions", False)
+                ):
+                    commands.extend(
+                        native.transition(
+                            surface_op,
+                            previous_end,
+                            points[0],
+                            safe_pdc,
+                            tolerance,
+                        )
+                    )
                 commands.extend(native.singlepass(surface_op, points))
+                previous_end = points[-1]
     else:
         # Delegate layer-depth handling and hold-point logic to FreeCAD.
         prev_depth = depth_params[0]
         for layer_depth in depth_params:
+            previous_end = None
             for step in scan_data:
                 for points in step:
                     pts, max_z = native.multipass_preprocess(
@@ -1128,146 +1145,25 @@ def generate_toolpath(
                         layer_depth,
                     )
                     if pts:
+                        if (
+                            previous_end is not None
+                            and params.get("optimize_stepover_transitions", False)
+                        ):
+                            commands.extend(
+                                native.transition(
+                                    surface_op,
+                                    previous_end,
+                                    pts[0],
+                                    safe_pdc,
+                                    tolerance,
+                                )
+                            )
                         commands.extend(
                             native.multipass_process(surface_op, pts, max_z)
                         )
+                        previous_end = pts[-1]
             prev_depth = layer_depth
 
-
-    for pass_index, pass_z in enumerate(passes):
-        update_progress(
-            25 + (
-                pass_index
-                * 65.0
-                / max(1, len(passes))
-            ),
-            "OCL: pass %d/%d..."
-            % (
-                pass_index + 1,
-                len(passes),
-            ),
-        )
-
-        projected_polylines = []
-
-        for polyline in polylines:
-            projected = project_polyline_with_ocl(
-                surface,
-                cutter,
-                polyline,
-                pass_z,
-                float(params["sampling"]),
-                params["mode"],
-            )
-
-            if projected:
-                projected_polylines.append(projected)
-
-        if not projected_polylines:
-            continue
-
-        # Material-aware rest machining:
-        # only keep path portions where OCL reports that the STL is below
-        # the current pass depth. Already-machined regions are omitted.
-        cutting_segments = optimize_pass(
-            projected_polylines,
-            pass_z,
-            float(params["allowance_z"]),
-        )
-
-        if not cutting_segments:
-            FreeCAD.Console.PrintMessage(
-                "STL Surface V2: pass %d/%d skipped (no remaining material).\\n"
-                % (
-                    pass_index + 1,
-                    len(passes),
-                )
-            )
-            continue
-
-        segment_count = len(cutting_segments)
-
-        if params.get("optimize_stepover_transitions", False):
-            optimized_segments = []
-            previous_end = None
-
-            for points in cutting_segments:
-                points = optimize_linear_path(points, params)
-                if len(points) < 2:
-                    continue
-
-                if previous_end is not None and optimized_segments:
-                    transition = generate_optimized_transition(
-                        previous_end,
-                        points[0],
-                        surface,
-                        cutter,
-                        pass_z,
-                        float(params["sampling"]),
-                        float(params["linear_deflection"]),
-                    )
-
-                    if transition is not None:
-                        optimized_segments[-1].extend(transition)
-                        points = points[1:]
-
-                if len(points) >= 2:
-                    optimized_segments.append(points)
-                    previous_end = points[-1]
-
-            cutting_segments = optimized_segments
-            segment_count = len(cutting_segments)
-
-        for segment_index, points in enumerate(cutting_segments):
-            points = optimize_linear_path(points, params)
-
-            if len(points) < 2:
-                continue
-
-            commands.append(
-                Path.Command(
-                    "G0",
-                    {"Z": safe_z},
-                )
-            )
-
-            commands.append(
-                Path.Command(
-                    "G0",
-                    {
-                        "X": points[0].x,
-                        "Y": points[0].y,
-                        "Z": pass_z,
-                    },
-                )
-            )
-
-            for point in points:
-                cut_z = max(
-                    point.z + float(params["allowance_z"]),
-                    pass_z,
-                )
-
-                commands.append(
-                    Path.Command(
-                        "G1",
-                        {
-                            "X": point.x,
-                            "Y": point.y,
-                            "Z": cut_z,
-                        },
-                    )
-                )
-
-        update_progress(
-            90,
-            "Optimizing pass %d/%d: %d cutting segments..."
-            % (
-                pass_index + 1,
-                len(passes),
-                segment_count,
-            ),
-        )
 
     commands.append(
         Path.Command(
