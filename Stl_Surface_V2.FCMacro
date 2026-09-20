@@ -668,7 +668,7 @@ def split_remaining_segments(
     for point in points:
         target_z = point.z + float(allowance_z)
 
-        if target_z < float(pass_z) - float(tolerance):
+        if target_z > float(pass_z) + float(tolerance):
             current.append(point)
         else:
             if len(current) >= 2:
@@ -679,6 +679,83 @@ def split_remaining_segments(
         remaining.append(current)
 
     return remaining
+
+
+
+def generate_optimized_transition(
+    p1,
+    p2,
+    surface,
+    cutter,
+    pass_z,
+    sampling,
+    linear_deflection,
+):
+    """
+    FreeCAD 1.1.3-style optimized step-over transition.
+
+    Keep the cutter down only for short transitions (up to about 2x the
+    cutter diameter) and only when OCL reports a small Z variation.
+    Otherwise the caller keeps the normal retract/rapid transition.
+    """
+    if p1 is None or p2 is None:
+        return None
+
+    diameter = float(cutter.getDiameter())
+    if diameter <= 0.0:
+        return None
+
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+    if dx * dx + dy * dy > (2.0 * diameter) ** 2:
+        return None
+
+    transition = project_polyline_with_ocl(
+        surface,
+        cutter,
+        [
+            (p1.x, p1.y, 0.0),
+            (p2.x, p2.y, 0.0),
+        ],
+        pass_z,
+        sampling,
+        "Finishing",
+    )
+
+    if len(transition) < 2:
+        return None
+
+    if linear_deflection > 0.0:
+        transition = PathUtils.simplify3dLine(
+            transition,
+            tolerance=linear_deflection,
+        )
+
+    zs = [p.z for p in transition]
+    if abs(min(zs) - max(zs)) >= diameter:
+        return None
+
+    z_floor = min(p1.z, p2.z)
+    result = []
+
+    for point in transition[1:-1]:
+        result.append(
+            FreeCAD.Vector(
+                point.x,
+                point.y,
+                max(point.z, z_floor),
+            )
+        )
+
+    result.append(
+        FreeCAD.Vector(
+            p2.x,
+            p2.y,
+            p2.z,
+        )
+    )
+
+    return result
 
 
 def optimize_pass(
@@ -899,6 +976,11 @@ def create_operation(job, mesh_obj, tool_controller, params):
         "LinearDeflection",
         "Optimization",
     )
+    add_prop(
+        "App::PropertyString",
+        "OptimizationBackend",
+        "Optimization",
+    )
 
     op.IsCustomOp = True
     op.STLSource = mesh_obj
@@ -917,6 +999,7 @@ def create_operation(job, mesh_obj, tool_controller, params):
     op.OptimizeStepOverTransitions = params["optimize_stepover_transitions"]
     op.GapThreshold = params["gap_threshold"]
     op.LinearDeflection = params["linear_deflection"]
+    op.OptimizationBackend = "FreeCAD 1.1.3 PathUtils + OCL transition engine"
 
     return op
 
@@ -1051,6 +1134,37 @@ def generate_toolpath(
             continue
 
         segment_count = len(cutting_segments)
+
+        if params.get("optimize_stepover_transitions", False):
+            optimized_segments = []
+            previous_end = None
+
+            for points in cutting_segments:
+                points = optimize_linear_path(points, params)
+                if len(points) < 2:
+                    continue
+
+                if previous_end is not None and optimized_segments:
+                    transition = generate_optimized_transition(
+                        previous_end,
+                        points[0],
+                        surface,
+                        cutter,
+                        pass_z,
+                        float(params["sampling"]),
+                        float(params["linear_deflection"]),
+                    )
+
+                    if transition is not None:
+                        optimized_segments[-1].extend(transition)
+                        points = points[1:]
+
+                if len(points) >= 2:
+                    optimized_segments.append(points)
+                    previous_end = points[-1]
+
+            cutting_segments = optimized_segments
+            segment_count = len(cutting_segments)
 
         for segment_index, points in enumerate(cutting_segments):
             points = optimize_linear_path(points, params)
