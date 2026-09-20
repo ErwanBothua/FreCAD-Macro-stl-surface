@@ -758,14 +758,20 @@ def generate_toolpath(mesh_obj, tool_controller, params, job, progress=None):
 
     commands.append(Path.Command("G0", {"Z": safe_z}))
 
-    # Set feed using the Job's Tool Controller.
-    for cmd in commands:
-        if cmd.Name == "G1":
-            try:
-                FeedRate.setFeedRate([cmd], tool_controller)
-            except Exception:
-                pass
-            break
+    # Apply the Job Tool Controller feed/rapid rates to the COMPLETE path.
+    # FreeCAD distinguishes G0 rapid moves from G1 cutting moves:
+    #   G0 horizontal -> HorizRapid
+    #   G0 vertical   -> VertRapid
+    #   G1 horizontal -> HorizFeed
+    #   G1 vertical   -> VertFeed
+    # This is required so Cycle Time estimates Safe Height retracts and
+    # positioning moves with the rapid rates, not the cutting feed.
+    try:
+        FeedRate.setFeedRate(commands, tool_controller)
+    except Exception as e:
+        FreeCAD.Console.PrintError(
+            "Feed/rapid rate assignment failed: %s\\n" % str(e)
+        )
 
     update_progress(100, "Calculation complete")
     return commands
