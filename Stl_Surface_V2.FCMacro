@@ -272,13 +272,34 @@ class _SurfaceSupportOperationShim:
 
 
 def make_ocl_surface(mesh_obj, linear_deflection=0.001):
-    """Use FreeCAD SurfaceSupport's native Mesh -> OCL conversion."""
+    """Use FreeCAD SurfaceSupport native Mesh -> OCL conversion.
+
+    FreeCAD 1.1.x exposes Mesh.Facets as a Python list of MeshFacet
+    objects, while SurfaceSupport._makeSTL() expects the older
+    model.Mesh.Facets.Points form. Keep only this compatibility adapter
+    here and let SurfaceSupport perform the actual OCL/STL conversion.
+    """
+    class _NativeMeshFacetAdapter:
+        def __init__(self, mesh):
+            self._mesh = mesh
+
+        @property
+        def Points(self):
+            return [facet.Points for facet in self._mesh.Facets]
+
+    class _NativeMeshModelAdapter:
+        def __init__(self, mesh_obj):
+            self.Mesh = _NativeMeshFacetAdapter(mesh_obj.Mesh)
+
     shim = _SurfaceSupportOperationShim(
         None,
         linear_deflection=linear_deflection,
     )
+
+    model_adapter = _NativeMeshModelAdapter(mesh_obj)
+
     return PathSurfaceSupport._makeSTL(
-        mesh_obj,
+        model_adapter,
         shim,
         ocl,
         model_type="M",
