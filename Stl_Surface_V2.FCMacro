@@ -630,9 +630,22 @@ class NativeSurfaceAlgorithmAdapter:
         self.impl = PathSurface.ObjectSurface.__new__(PathSurface.ObjectSurface)
         self.impl.cutter = cutter
         self.impl.toolDiam = float(tool_controller.Tool.Diameter.Value)
-        self.impl.horizFeed = getattr(tool_controller, "HorizFeed", 0.0)
-        self.impl.horizRapid = getattr(tool_controller, "HorizRapid", 0.0)
-        self.impl.vertRapid = getattr(tool_controller, "VertRapid", 0.0)
+
+        # Native FreeCAD Surface builds Path.Command dictionaries from these
+        # feed values. ToolController properties may be Quantity objects;
+        # Path.Command requires plain numeric values.
+        def _numeric(value, default=0.0):
+            try:
+                if hasattr(value, "Value"):
+                    return float(value.Value)
+                return float(value)
+            except Exception:
+                return float(default)
+
+        self.impl.horizFeed = _numeric(getattr(tool_controller, "HorizFeed", 0.0))
+        self.impl.horizRapid = _numeric(getattr(tool_controller, "HorizRapid", 0.0))
+        self.impl.vertRapid = _numeric(getattr(tool_controller, "VertRapid", 0.0))
+        self.impl.vertFeed = _numeric(getattr(tool_controller, "VertFeed", 0.0))
         self.impl.CutClimb = params.get("cut_mode", "Climb") == "Climb"
         self.impl.preOLP = bool(params.get("optimize_linear_paths", True))
         self.impl.tmpCOM = FreeCAD.Vector(0.0, 0.0, 0.0)
