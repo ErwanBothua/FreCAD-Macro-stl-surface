@@ -279,17 +279,17 @@ def make_ocl_surface(mesh_obj, linear_deflection=0.001):
     model.Mesh.Facets.Points form. Keep only this compatibility adapter
     here and let SurfaceSupport perform the actual OCL/STL conversion.
     """
-    class _NativeMeshFacetAdapter:
+    class _NativeMeshFacetsAdapter:
         def __init__(self, mesh):
-            self._mesh = mesh
+            self.Points = [facet.Points for facet in mesh.Facets]
 
-        @property
-        def Points(self):
-            return [facet.Points for facet in self._mesh.Facets]
+    class _NativeMeshAdapter:
+        def __init__(self, mesh):
+            self.Facets = _NativeMeshFacetsAdapter(mesh)
 
     class _NativeMeshModelAdapter:
         def __init__(self, mesh_obj):
-            self.Mesh = _NativeMeshFacetAdapter(mesh_obj.Mesh)
+            self.Mesh = _NativeMeshAdapter(mesh_obj.Mesh)
 
     shim = _SurfaceSupportOperationShim(
         None,
