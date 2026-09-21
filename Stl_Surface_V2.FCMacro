@@ -281,7 +281,7 @@ def make_ocl_surface(mesh_obj, linear_deflection=0.001):
         mesh_obj,
         shim,
         ocl,
-        model_type="Mesh",
+        model_type="M",
     )
 
 
